@@ -1,0 +1,10 @@
+{
+  "boolq": 9427,
+  "arc_easy": 2251,
+  "arc_challenge": 1119,
+  "openbookqa": 4957,
+  "piqa": 0,
+  "social_iqa": 0,
+  "hellaswag": 39905,
+  "winogrande": 40398
+}
