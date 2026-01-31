@@ -46,6 +46,8 @@ class MetaTokenExtractor:
         
         print(f"Loading Cloud LLM: {cloud_model_name}")
         self.cloud_tokenizer = AutoTokenizer.from_pretrained(cloud_model_name)
+        if self.cloud_tokenizer.pad_token is None:
+            self.cloud_tokenizer.pad_token = self.cloud_tokenizer.eos_token
         self.cloud_model = AutoModel.from_pretrained(
             cloud_model_name,
             torch_dtype=torch.float16 if use_fp16 else torch.float32,
@@ -59,6 +61,8 @@ class MetaTokenExtractor:
         
         print(f"Loading Edge LLM: {edge_model_name}")
         self.edge_tokenizer = AutoTokenizer.from_pretrained(edge_model_name)
+        if self.edge_tokenizer.pad_token is None:
+            self.edge_tokenizer.pad_token = self.edge_tokenizer.eos_token
         self.edge_model = AutoModel.from_pretrained(
             edge_model_name,
             torch_dtype=torch.float16 if use_fp16 else torch.float32,
@@ -104,6 +108,83 @@ class MetaTokenExtractor:
                 formatted += f"Turn {i+1}: {turn}\n"
             formatted += f"Current: {current_utterance}"
             return formatted
+    
+    @torch.no_grad()
+    def extract_meta_tokens_batch(
+        self,
+        texts: List[str],
+        pooling: str = "mean",
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        배치로 메타토큰 추출 (속도 최적화)
+        
+        Args:
+            texts: 입력 텍스트 리스트
+            pooling: 토큰 풀링 방법
+            
+        Returns:
+            cloud_meta_tokens_list: List of [num_cloud_layers, hidden_dim]
+            edge_meta_tokens_list: List of [num_edge_layers, hidden_dim]
+        """
+        # Cloud LLM 배치 추론
+        cloud_inputs = self.cloud_tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        ).to(self.device)
+        
+        cloud_outputs = self.cloud_model(
+            **cloud_inputs,
+            output_hidden_states=True,
+        )
+        
+        # Edge LLM 배치 추론
+        edge_inputs = self.edge_tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            padding=True,
+        ).to(self.device)
+        
+        edge_outputs = self.edge_model(
+            **edge_inputs,
+            output_hidden_states=True,
+        )
+        
+        # 배치 내 각 샘플에 대해 메타토큰 추출
+        batch_size = len(texts)
+        cloud_meta_tokens_list = []
+        edge_meta_tokens_list = []
+        
+        for b in range(batch_size):
+            # Cloud 메타토큰
+            cloud_tokens = []
+            for layer_output in cloud_outputs.hidden_states:
+                if pooling == "mean":
+                    token = layer_output[b].mean(dim=0)
+                elif pooling == "cls":
+                    token = layer_output[b, 0, :]
+                elif pooling == "last":
+                    token = layer_output[b, -1, :]
+                cloud_tokens.append(token.cpu())
+            cloud_meta_tokens_list.append(torch.stack(cloud_tokens))
+            
+            # Edge 메타토큰
+            edge_tokens = []
+            for layer_output in edge_outputs.hidden_states:
+                if pooling == "mean":
+                    token = layer_output[b].mean(dim=0)
+                elif pooling == "cls":
+                    token = layer_output[b, 0, :]
+                elif pooling == "last":
+                    token = layer_output[b, -1, :]
+                edge_tokens.append(token.cpu())
+            edge_meta_tokens_list.append(torch.stack(edge_tokens))
+        
+        return cloud_meta_tokens_list, edge_meta_tokens_list
     
     @torch.no_grad()
     def extract_meta_tokens(
@@ -383,40 +464,81 @@ class MetaTokenDifferenceAnalyzer:
         dataset: List[Dict],
         num_stages: int = 3,
         save_path: Optional[str] = None,
+        batch_size: int = 32,
     ) -> List[MetaTokenDifference]:
         """
-        전체 데이터셋 분석
+        전체 데이터셋 분석 (배치 처리로 속도 최적화)
         
         Args:
             dataset: [{'id': ..., 'history': [...], 'utterance': ...}, ...] (대화 형식)
                      또는 [{'id': ..., 'full_text': ...}, ...] (reasoning task 형식)
             num_stages: 커리큘럼 스테이지 수
             save_path: 결과 저장 경로
+            batch_size: 배치 크기 (GPU 메모리에 따라 조정)
             
         Returns:
             difficulties: 각 샘플의 난이도 정보
         """
-        print(f"Analyzing {len(dataset)} samples...")
+        print(f"Analyzing {len(dataset)} samples with batch_size={batch_size}...")
         
-        # 1단계: 모든 샘플 분석
+        # 중간 저장 경로 설정
+        checkpoint_path = save_path.replace('.json', '_checkpoint.json') if save_path else None
+        
+        # 1단계: 배치 단위로 모든 샘플 분석
         difficulties = []
-        for i, sample in enumerate(dataset):
-            if i % 100 == 0:
-                print(f"  Progress: {i}/{len(dataset)}")
+        num_batches = (len(dataset) + batch_size - 1) // batch_size
+        save_interval = 100  # 100 배치마다 저장 (약 6,400 샘플마다)
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(dataset))
+            batch = dataset[start_idx:end_idx]
             
-            # 형식 감지: 'full_text' 필드가 있으면 reasoning task, 없으면 dialogue
-            if 'full_text' in sample:
-                diff = self.analyze_sample(
-                    sample_id=sample['id'],
-                    full_text=sample['full_text'],
+            if batch_idx % 10 == 0:
+                print(f"  Progress: {start_idx}/{len(dataset)} ({start_idx/len(dataset)*100:.1f}%)")
+            
+            # 배치 내 텍스트 추출
+            batch_texts = []
+            batch_ids = []
+            for sample in batch:
+                if 'full_text' in sample:
+                    text = self.extractor._format_input(full_text=sample['full_text'])
+                else:
+                    text = self.extractor._format_input(
+                        dialogue_history=sample['history'],
+                        current_utterance=sample['utterance']
+                    )
+                batch_texts.append(text)
+                batch_ids.append(sample['id'])
+            
+            # 배치 메타토큰 추출
+            cloud_tokens_list, edge_tokens_list = self.extractor.extract_meta_tokens_batch(batch_texts)
+            
+            # 각 샘플의 난이도 계산
+            for i, sample_id in enumerate(batch_ids):
+                # 레이어별 차이 계산
+                layer_diffs = self.extractor.compute_layer_differences(
+                    cloud_tokens_list[i],
+                    edge_tokens_list[i],
+                    metric=self.metric,
                 )
-            else:
-                diff = self.analyze_sample(
-                    sample_id=sample['id'],
-                    dialogue_history=sample['history'],
-                    current_utterance=sample['utterance'],
-                )
-            difficulties.append(diff)
+                
+                # 난이도 점수 계산
+                difficulty_scores = self.scorer.compute_difficulty_scores(layer_diffs)
+                
+                difficulties.append(MetaTokenDifference(
+                    sample_id=sample_id,
+                    layer_diffs=layer_diffs,
+                    difficulty_scores=difficulty_scores,
+                    difficulty_percentile=0.5,  # placeholder
+                    curriculum_stage=0,  # placeholder
+                ))
+            
+            # 중간 저장 (100 배치마다)
+            if checkpoint_path and (batch_idx + 1) % save_interval == 0:
+                print(f"  💾 Checkpoint: Saving {len(difficulties)} samples...")
+                self._save_difficulties(difficulties, checkpoint_path)
+                print(f"  ✓ Checkpoint saved to {checkpoint_path}")
         
         # 2단계: 백분위 계산
         all_scores = [

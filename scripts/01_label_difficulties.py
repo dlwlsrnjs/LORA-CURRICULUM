@@ -191,8 +191,8 @@ def main():
     parser.add_argument(
         '--batch_size',
         type=int,
-        default=1,
-        help='Batch size (currently only 1 supported)',
+        default=32,
+        help='Batch size for parallel processing (adjust based on GPU memory)',
     )
     parser.add_argument(
         '--max_samples',
@@ -247,6 +247,7 @@ def main():
         dataset=dataset,
         num_stages=args.num_stages,
         save_path=args.output_path,
+        batch_size=args.batch_size,
     )
     
     # Print statistics
